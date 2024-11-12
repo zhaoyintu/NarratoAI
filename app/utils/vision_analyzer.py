@@ -1,3 +1,5 @@
+# 修改后的 vision_analyzer.py
+
 import json
 from typing import List, Union, Dict
 import os
@@ -6,66 +8,46 @@ from loguru import logger
 from tqdm import tqdm
 import asyncio
 from tenacity import retry, stop_after_attempt, RetryError, retry_if_exception_type, wait_exponential
-from google.api_core import exceptions
-import google.generativeai as genai
+from abc import ABC, abstractmethod
 import PIL.Image
 import traceback
 
-
-class VisionAnalyzer:
-    """视觉分析器类"""
-
-    def __init__(self, model_name: str = "gemini-1.5-flash", api_key: str = None):
-        """初始化视觉分析器"""
+class BaseVisionAnalyzer(ABC):
+    """视觉分析器基类"""
+    
+    def __init__(self, model_name: str, api_key: str):
         if not api_key:
             raise ValueError("必须提供API密钥")
-
+            
         self.model_name = model_name
         self.api_key = api_key
-
-        # 初始化配置
         self._configure_client()
-
+    
+    @abstractmethod
     def _configure_client(self):
         """配置API客户端"""
-        genai.configure(api_key=self.api_key)
-        # 开放 Gemini 模型安全设置
-        from google.generativeai.types import HarmCategory, HarmBlockThreshold
-        safety_settings = {
-            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-        }
-        self.model = genai.GenerativeModel(self.model_name, safety_settings=safety_settings)
-
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=4, max=10),
-        retry=retry_if_exception_type(exceptions.ResourceExhausted)
-    )
-    async def _generate_content_with_retry(self, prompt, batch):
-        """使用重试机制的内部方法来调用 generate_content_async"""
-        try:
-            return await self.model.generate_content_async([prompt, *batch])
-        except exceptions.ResourceExhausted as e:
-            print(f"API配额限制: {str(e)}")
-            raise RetryError("API调用失败")
+        pass
+        
+    @abstractmethod
+    async def _generate_content_with_retry(self, prompt: str, image_batch: List[PIL.Image.Image]) -> str:
+        """带重试机制的内容生成"""
+        pass
+        
+    @abstractmethod
+    def process_response(self, response: any) -> str:
+        """处理API响应"""
+        pass
 
     async def analyze_images(self,
                            images: Union[List[str], List[PIL.Image.Image]],
                            prompt: str,
                            batch_size: int = 5) -> List[Dict]:
-        """批量分析多张图片"""
+        """批量分析多张图片的通用实现"""
         try:
             # 加载图片
             if isinstance(images[0], str):
                 logger.info("正在加载图片...")
                 images = self.load_images(images)
-
-            # 验证图片列表
-            if not images:
-                raise ValueError("图片列表为空")
 
             # 验证每个图片对象
             valid_images = []
@@ -93,16 +75,13 @@ class VisionAnalyzer:
                             if i > 0:
                                 await asyncio.sleep(2)
 
-                            # 确保每个批次的图片都是有效的
-                            valid_batch = [img for img in batch if isinstance(img, PIL.Image.Image)]
-                            if not valid_batch:
-                                raise ValueError(f"批次 {i // batch_size} 中没有有效的图片")
-
-                            response = await self._generate_content_with_retry(prompt, valid_batch)
+                            response = await self._generate_content_with_retry(prompt, batch)
+                            processed_response = self.process_response(response)
+                            
                             results.append({
                                 'batch_index': i // batch_size,
-                                'images_processed': len(valid_batch),
-                                'response': response.text,
+                                'images_processed': len(batch),
+                                'response': processed_response,
                                 'model_used': self.model_name
                             })
                             break
@@ -120,7 +99,6 @@ class VisionAnalyzer:
                                     'model_used': self.model_name
                                 })
                             else:
-                                logger.info(f"批次 {i // batch_size} 处理失败，等待60秒后重试当前批次...")
                                 await asyncio.sleep(60)
 
                     pbar.update(1)
@@ -132,35 +110,8 @@ class VisionAnalyzer:
             logger.error(error_msg)
             raise Exception(error_msg)
 
-    def save_results_to_txt(self, results: List[Dict], output_dir: str):
-        """将分析结果保存到txt文件"""
-        # 确保输出目录存在
-        os.makedirs(output_dir, exist_ok=True)
-
-        for result in results:
-            if not result.get('image_paths'):
-                continue
-
-            response_text = result['response']
-            image_paths = result['image_paths']
-
-            img_name_start = Path(image_paths[0]).stem.split('_')[-1]
-            img_name_end = Path(image_paths[-1]).stem.split('_')[-1]
-            txt_path = os.path.join(output_dir, f"frame_{img_name_start}_{img_name_end}.txt")
-
-            # 保存结果到txt文件
-            with open(txt_path, 'w', encoding='utf-8') as f:
-                f.write(response_text.strip())
-            print(f"已保存分析结果到: {txt_path}")
-
     def load_images(self, image_paths: List[str]) -> List[PIL.Image.Image]:
-        """
-        加载多张图片
-        Args:
-            image_paths: 图片路径列表
-        Returns:
-            加载后的PIL Image对象列表
-        """
+        """加载多张图片的通用实现"""
         images = []
         failed_images = []
 
@@ -172,9 +123,7 @@ class VisionAnalyzer:
                     continue
 
                 img = PIL.Image.open(img_path)
-                # 确保图片被完全加载
                 img.load()
-                # 转换为RGB模式
                 if img.mode != 'RGB':
                     img = img.convert('RGB')
                 images.append(img)
@@ -190,3 +139,98 @@ class VisionAnalyzer:
             raise ValueError("没有成功加载任何图片")
 
         return images
+
+class GeminiVisionAnalyzer(BaseVisionAnalyzer):
+    """Gemini 视觉分析器实现"""
+    
+    def _configure_client(self):
+        import google.generativeai as genai
+        from google.generativeai.types import HarmCategory, HarmBlockThreshold
+        
+        genai.configure(api_key=self.api_key)
+        safety_settings = {
+            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+        }
+        self.model = genai.GenerativeModel(self.model_name, safety_settings=safety_settings)
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10)
+    )
+    async def _generate_content_with_retry(self, prompt: str, image_batch: List[PIL.Image.Image]) -> str:
+        try:
+            response = await self.model.generate_content_async([prompt, *image_batch])
+            return response
+        except Exception as e:
+            logger.error(f"Gemini生成内容失败: {str(e)}")
+            raise
+
+    def process_response(self, response: any) -> str:
+        if not response or not response.text:
+            raise ValueError("Invalid response from Gemini API")
+        return response.text.strip()
+
+class GPTVisionAnalyzer(BaseVisionAnalyzer):
+    """GPT-4 Vision 分析器实现"""
+    
+    def _configure_client(self):
+        from openai import AsyncOpenAI
+        self.client = AsyncOpenAI(api_key=self.api_key)
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10)
+    )
+    async def _generate_content_with_retry(self, prompt: str, image_batch: List[PIL.Image.Image]) -> str:
+        try:
+            import base64
+            from io import BytesIO
+            
+            # 准备消息内容
+            messages = []
+            messages.append({"type": "text", "text": prompt})
+            
+            # 添加所有图片
+            for image in image_batch:
+                buffered = BytesIO()
+                image.save(buffered, format="JPEG")
+                image_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+                messages.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{image_base64}"
+                    }
+                })
+
+            # 调用API
+            response = await self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[{"role": "user", "content": messages}]
+            )
+            
+            return response
+        except Exception as e:
+            logger.error(f"GPT-4 Vision生成内容失败: {str(e)}")
+            raise
+
+    def process_response(self, response: any) -> str:
+        if not response or not response.choices:
+            raise ValueError("Invalid response from GPT-4 Vision API")
+        return response.choices[0].message.content.strip()
+
+def create_vision_analyzer(model_type: str, model_name: str, api_key: str) -> BaseVisionAnalyzer:
+    """工厂函数：创建视觉分析器实例"""
+    analyzers = {
+        'gemini': GeminiVisionAnalyzer,
+        'gpt': GPTVisionAnalyzer,
+        # 在这里添加新的模型支持
+    }
+    
+    analyzer_class = analyzers.get(model_type.lower())
+    if not analyzer_class:
+        raise ValueError(f"不支持的模型类型: {model_type}")
+        
+    return analyzer_class(model_name, api_key)
